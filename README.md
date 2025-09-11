@@ -1,6 +1,6 @@
-# Web Monitor
+# Crypto Web Monitor
 
-Automatically capture and monitor changes on web pages over time using Puppeteer.
+Automatically capture and monitor changes on crypto protocol dashboards over time using Puppeteer with wallet authentication support.
 
 ## Features
 
@@ -11,6 +11,7 @@ Automatically capture and monitor changes on web pages over time using Puppeteer
 - 📊 Change analysis and history tracking
 - 🎯 CSS selector targeting for specific content
 - 💾 JSON-based data storage
+- 🔐 Wallet authentication via session cookies
 
 ## Quick Start
 
