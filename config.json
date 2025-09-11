@@ -1,0 +1,33 @@
+{
+  "schedule": "0 */2 * * *",
+  "sites": [
+    {
+      "name": "Uniswap Portfolio",
+      "url": "https://app.uniswap.org/#/portfolio",
+      "cookiesFile": "./cookies/uniswap.json",
+      "textSelector": "[data-testid='portfolio-page']",
+      "waitFor": {
+        "selector": "[data-testid='portfolio-page']",
+        "delay": 3000
+      }
+    },
+    {
+      "name": "Aave Dashboard",
+      "url": "https://app.aave.com/",
+      "cookiesFile": "./cookies/aave.json",
+      "textSelector": ".Dashboard__content",
+      "waitFor": {
+        "delay": 4000
+      }
+    },
+    {
+      "name": "Compound Portfolio",
+      "url": "https://app.compound.finance/",
+      "cookiesFile": "./cookies/compound.json",
+      "textSelector": ".portfolio-container",
+      "waitFor": {
+        "delay": 3000
+      }
+    }
+  ]
+}
