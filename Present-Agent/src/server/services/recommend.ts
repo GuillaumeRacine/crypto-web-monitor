@@ -219,12 +219,89 @@ export class RecommendService {
       }
     }
 
+    // User embedding boost: personalize based on user's historical preferences
+    if (input.userId && this.pool && this.embed && items.length > 0) {
+      try {
+        const { applyUserEmbeddingBoost } = await import('./user-embeddings.js');
+        items = await applyUserEmbeddingBoost(items, input.userId, this.pool, this.embed, 0.3);
+        items.sort((a, b) => b.score - a.score);
+
+        if (process.env.LOG_LEVEL === 'debug') {
+          console.debug(`[recommend] Applied user embedding boost for ${input.userId}`);
+        }
+      } catch (error: any) {
+        console.warn('[recommend] user embedding boost failed:', error.message);
+        // Continue with original ranking
+      }
+    }
+
+    // Collaborative filtering boost: "users like you" recommendations
+    if (input.userId && this.pool && items.length > 0) {
+      try {
+        const { applyCollaborativeBoost } = await import('./collaborative.js');
+        items = await applyCollaborativeBoost(items, input.userId, this.pool, 0.25);
+        items.sort((a, b) => b.score - a.score);
+
+        if (process.env.LOG_LEVEL === 'debug') {
+          console.debug(`[recommend] Applied collaborative filtering boost for ${input.userId}`);
+        }
+      } catch (error: any) {
+        console.warn('[recommend] collaborative filtering boost failed:', error.message);
+        // Continue with original ranking
+      }
+    }
+
+    // Recipient profile learning: boost based on what worked for this specific recipient
+    if (input.userId && input.recipientId && this.pool && items.length > 0) {
+      try {
+        const { applyRecipientBoost } = await import('./recipient-learning.js');
+        items = await applyRecipientBoost(items, input.userId, input.recipientId, this.pool, 0.35);
+        items.sort((a, b) => b.score - a.score);
+
+        if (process.env.LOG_LEVEL === 'debug') {
+          console.debug(`[recommend] Applied recipient profile boost for ${input.recipientId}`);
+        }
+      } catch (error: any) {
+        console.warn('[recommend] recipient profile boost failed:', error.message);
+        // Continue with original ranking
+      }
+    }
+
     // RERANKING: Apply Cohere reranking for final quality boost (if enabled)
     if (this.reranker && this.reranker.isEnabled() && qText && items.length > 0) {
       try {
         items = await this.reranker.rerank(qText, items, limit);
       } catch (error: any) {
         console.warn('[recommend] reranking failed:', error.message);
+        // Continue with original ranking
+      }
+    }
+
+    // DIVERSITY OPTIMIZATION: Apply MMR to avoid filter bubbles
+    if (items.length > 1) {
+      try {
+        const { diversifyResults, analyzeDiversity } = await import('./diversity.js');
+
+        // Log diversity metrics before optimization
+        if (process.env.LOG_LEVEL === 'debug') {
+          const beforeMetrics = analyzeDiversity(items);
+          console.debug('[recommend] Diversity before MMR:', beforeMetrics);
+        }
+
+        // Apply MMR with 70% relevance, 30% diversity
+        items = diversifyResults(items, {
+          lambda: 0.7,
+          maxResults: limit,
+          diversityMetrics: ['category', 'vendor', 'price', 'facets'],
+        });
+
+        // Log diversity metrics after optimization
+        if (process.env.LOG_LEVEL === 'debug') {
+          const afterMetrics = analyzeDiversity(items);
+          console.debug('[recommend] Diversity after MMR:', afterMetrics);
+        }
+      } catch (error: any) {
+        console.warn('[recommend] diversity optimization failed:', error.message);
         // Continue with original ranking
       }
     }

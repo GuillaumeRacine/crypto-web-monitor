@@ -378,6 +378,36 @@ async function main() {
         } finally { await client.end(); }
       }
 
+      // Get current occasion
+      if (req.method === "GET" && url.pathname === "/api/occasions/current") {
+        try {
+          const { getCurrentOccasion, getOccasionMessage } = await import('./services/occasion-detector.js');
+          const occasion = getCurrentOccasion();
+          const message = getOccasionMessage(occasion);
+          return send(200, { occasion, message });
+        } catch (e: any) {
+          console.error("GET /api/occasions/current error:", e?.message || e);
+          return send(500, { error: "occasion fetch failed" });
+        }
+      }
+
+      // Get trending products
+      if (req.method === "GET" && url.pathname === "/api/trending") {
+        try {
+          const { trendingCache } = await import('./services/trending.js');
+          const { default: pg } = await import("pg");
+          const pool = new pg.Pool({ connectionString: cfg.postgresUrl! });
+
+          const trendingIds = await trendingCache.getTrendingIds(pool);
+          await pool.end();
+
+          return send(200, { trendingIds: Array.from(trendingIds) });
+        } catch (e: any) {
+          console.error("GET /api/trending error:", e?.message || e);
+          return send(500, { error: "trending fetch failed" });
+        }
+      }
+
       // Admin: list auto-assigned categories for audit
       if (req.method === "GET" && url.pathname === "/api/admin/auto_categories") {
         const method = url.searchParams.get('method') || 'all'; // 'all' | 'suggestion' | 'vendor_majority' | 'global_top'
@@ -470,16 +500,27 @@ async function main() {
       }
 
       if (req.method === "POST" && url.pathname === "/api/recommend") {
+        const startTime = Date.now();
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(chunk as Buffer);
         const bodyText = Buffer.concat(chunks).toString("utf8");
         const body = bodyText ? JSON.parse(bodyText) : {};
+
+        // Fast mode: skip heavy personalization if requested
+        const fastMode = body.fastMode === true;
+
         // Attach user as recipient for graph-based boosts if present
         const cookies = parseCookies(req);
         const sid = cookies["sid"]; const sess = sid ? sessions.get(sid) : undefined;
         if (sess && !body.recipientId) body.recipientId = sess.userId;
+
+        // Get session ID for tracking
+        const { getSessionId, sessionStore } = await import('./services/session.js');
+        const sessionId = getSessionId(req);
+        const sessionContext = sessionStore.getRecommendationContext(sessionId);
+
         // Merge saved context to enrich query (Postgres only)
-        if (sess) {
+        if (sess && !fastMode) {
           try {
             const { default: pg } = await import("pg");
             const client = new pg.Client({ connectionString: cfg.postgresUrl! });
@@ -495,7 +536,41 @@ async function main() {
           } catch {}
         }
 
+        // Apply session-based context (price range, category boost, exclude abandoned)
+        if (!body.query) body.query = {};
+        if (sessionContext.priceRange) {
+          if (!body.query.budgetMin) body.query.budgetMin = sessionContext.priceRange.min;
+          if (!body.query.budgetMax) body.query.budgetMax = sessionContext.priceRange.max;
+        }
+        if (sessionContext.categoryBoost && sessionContext.categoryBoost.length > 0) {
+          // Add inferred categories if user hasn't specified any
+          if (!body.query.categories || body.query.categories.length === 0) {
+            body.query.categories = sessionContext.categoryBoost;
+          }
+        }
+        // Pass exclude IDs to filter out abandoned products
+        if (sessionContext.excludeIds && sessionContext.excludeIds.length > 0) {
+          body.excludeIds = sessionContext.excludeIds;
+        }
+
+        // Performance tracking
+        const contextTime = Date.now() - startTime;
+
         const result = await recommender.recommend(body);
+
+        // Filter out excluded products from results
+        if (body.excludeIds && body.excludeIds.length > 0) {
+          const excludeSet = new Set(body.excludeIds);
+          result.items = result.items.filter(item => !excludeSet.has(item.product.id));
+        }
+
+        // Add performance metrics
+        result.performanceMetrics = {
+          contextLoadMs: contextTime,
+          recommendationMs: result.tookMs,
+          totalMs: Date.now() - startTime,
+        };
+
         // Log assistant summary message
         if (sess) {
           try {
@@ -676,9 +751,19 @@ async function main() {
           console.debug('[chat] merged context (after merging extracted)', merged);
         }
 
-        // Decide readiness: proceed if we have ANY of budget OR recipient OR categories OR clear occasion signal
+        // Decide readiness: require meaningful context, not just budget
+        // Need at least 2 of: [budget, recipient, interests/categories, occasion]
         const occasionSignal = /birthday|anniversary|wedding|holiday|valentine|thank|graduation|baby|diwali|christmas|hanukkah|eid/i.test(text);
-        const ready = (merged.budgetMin != null || merged.budgetMax != null) || (!!recipientKey) || (merged.categories?.length > 0) || occasionSignal;
+        const hasBudget = merged.budgetMin != null || merged.budgetMax != null;
+        const hasRecipient = !!recipientKey;
+        const hasInterests = (merged.categories?.length > 0) || (merged.interests?.length > 0) || (merged.values?.length > 0);
+        const hasOccasion = occasionSignal || !!merged.occasion;
+
+        // Count how many context signals we have
+        const contextSignals = [hasBudget, hasRecipient, hasInterests, hasOccasion].filter(Boolean).length;
+
+        // Require at least 2 signals to proceed (prevents showing products for "budget $50" alone)
+        const ready = contextSignals >= 2;
 
         const contextSummary = (() => {
           const parts: string[] = [];
@@ -691,11 +776,16 @@ async function main() {
 
         if (!ready) {
           let prompt: string;
-          const needBudget = merged.budgetMin == null && merged.budgetMax == null;
-          const needRecipient = !recipientKey && !(merged.categories?.length > 0);
+          const needBudget = !hasBudget;
+          const needRecipient = !hasRecipient;
+          const needInterests = !hasInterests;
+          const needOccasion = !hasOccasion;
+
           const missing: string[] = [];
           if (needBudget) missing.push('budget');
-          if (needRecipient) missing.push('recipient or interests');
+          if (needRecipient) missing.push('recipient');
+          if (needInterests && !hasRecipient) missing.push('interests or hobbies');
+          if (needOccasion && !hasRecipient && !hasInterests) missing.push('occasion');
 
           // Build empathetic response with variety
           let fallback: string;
@@ -718,33 +808,52 @@ async function main() {
             : ["Absolutely", "Sure thing", "I'd love to help", "Let's do it"].map(a => `${a}! `);
           const ack = acknowledgments[Math.floor(Math.random() * acknowledgments.length)];
 
-          if (needBudget && needRecipient) {
+          // Build contextual follow-up questions
+          if (contextSignals === 0) {
+            // No context at all - ask for everything
             const questions = [
               "Who's the gift for, and what budget are you thinking?",
               "Tell me about the person and your budget?",
-              "Who's this for, and what's your price range?",
-              "Who are you shopping for, and how much are you looking to spend?"
+              "Who's this for, what's the occasion, and what's your price range?"
             ];
             fallback = prefix + ack + questions[Math.floor(Math.random() * questions.length)];
-          } else if (needBudget) {
-            const budgetQuestions = [
-              "What's your budget looking like?",
-              "Any price range in mind?",
-              "How much are you thinking?",
-              "What's your spending range?",
-              "Got a budget in mind?"
-            ];
-            fallback = prefix + ack + budgetQuestions[Math.floor(Math.random() * budgetQuestions.length)];
-          } else if (needRecipient) {
-            const recipientQuestions = [
-              "Who's the gift for? Any interests I should know about?",
-              "Who's this for, and what are they into?",
-              "Tell me about the person—what do they love?",
-              "Who are you shopping for?"
-            ];
-            fallback = prefix + ack + recipientQuestions[Math.floor(Math.random() * recipientQuestions.length)];
+          } else if (contextSignals === 1) {
+            // Have 1 signal, need 1 more - be specific about what's missing
+            if (hasBudget && !hasRecipient && !hasInterests) {
+              // Only have budget
+              const questions = [
+                "Got the budget! Who's the gift for? What are they into?",
+                "Perfect! Now tell me about the person—what do they love?",
+                "Great! Who's this for, and what are their interests?"
+              ];
+              fallback = prefix + questions[Math.floor(Math.random() * questions.length)];
+            } else if (hasRecipient && !hasBudget) {
+              // Only have recipient
+              const questions = [
+                `Got it—shopping for your ${recipientKey}! What's your budget, and what are they interested in?`,
+                `Perfect! What's your price range, and what does your ${recipientKey} enjoy?`
+              ];
+              fallback = prefix + questions[Math.floor(Math.random() * questions.length)];
+            } else if (hasInterests && !hasRecipient && !hasBudget) {
+              // Only have interests/categories
+              const questions = [
+                "Nice! Who's the gift for, and what's your budget?",
+                "Got it! Who's this for, and what price range?"
+              ];
+              fallback = prefix + questions[Math.floor(Math.random() * questions.length)];
+            } else if (hasOccasion && !hasRecipient && !hasBudget) {
+              // Only have occasion
+              const questions = [
+                "Perfect! Who's the gift for, and what's your budget?",
+                "Great! Tell me about the person and your price range?"
+              ];
+              fallback = prefix + questions[Math.floor(Math.random() * questions.length)];
+            } else {
+              fallback = prefix + "Could you share a bit more detail so I can find the perfect match?";
+            }
           } else {
-            fallback = prefix + "Could you share a bit more so I can find the perfect options?";
+            // Shouldn't reach here since contextSignals >= 2 means ready=true
+            fallback = prefix + "Let me find some great options for you!";
           }
           if (chatLlm) {
       const { systemPrompt, buildContextBlock, buildHistoryBlock } = await import('./services/prompts/chat.js');
@@ -832,7 +941,33 @@ async function main() {
         const result = await recommender.recommend(recBody);
 
         // Filter out inappropriate items based on recipient type
-        result.items = filterInappropriateProducts(result.items, recipientKey).slice(0, 5);
+        let filtered = filterInappropriateProducts(result.items, recipientKey);
+
+        // Quality-based filtering: only show recommendations above a score threshold
+        // If we have high-quality matches (score > 0.7), only show those
+        // Otherwise show up to 5 best matches, but minimum 3 if available
+        const highQuality = filtered.filter(item => item.score > 0.7);
+        const mediumQuality = filtered.filter(item => item.score > 0.5 && item.score <= 0.7);
+
+        if (highQuality.length >= 3) {
+          // Great matches - show only high quality, max 5
+          filtered = highQuality.slice(0, 5);
+        } else if (highQuality.length + mediumQuality.length >= 3) {
+          // Mix of quality - show high + some medium, max 5
+          filtered = [...highQuality, ...mediumQuality].slice(0, 5);
+        } else {
+          // Limited matches - show what we have, max 5
+          filtered = filtered.slice(0, 5);
+        }
+
+        result.items = filtered;
+
+        // Track recommendation quality for message customization
+        const avgScore = filtered.length > 0
+          ? filtered.reduce((sum, item) => sum + item.score, 0) / filtered.length
+          : 0;
+        const hasStrongMatches = avgScore > 0.7;
+        const hasLimitedResults = filtered.length < 3;
 
         // Build varied, emotionally aware intro
         const { buildEmpatheticIntro } = await import('./services/extract.js');
@@ -859,15 +994,32 @@ async function main() {
           reply += acks[Math.floor(Math.random() * acks.length)] + '. ';
         }
 
-        // Varied recommendation intros
-        const intros = [
-          "Here are some ideas I think they'll love:",
-          "I found a few things that caught my eye:",
-          "Check these out:",
-          "Here's what I'm thinking:",
-          "Let me show you a few options:",
-          "I've got some great options for you:"
-        ];
+        // Varied recommendation intros based on match quality
+        let intros: string[];
+        if (hasStrongMatches) {
+          intros = [
+            "Here are some ideas I think they'll love:",
+            "I found some great matches:",
+            "Check out these strong matches:",
+            "I've got some excellent options for you:",
+            "Here are my top picks:"
+          ];
+        } else if (hasLimitedResults) {
+          intros = [
+            "I found a few options that might work:",
+            "Here are some possibilities:",
+            "I have a couple ideas—want me to refine the search?",
+            "Here's what I found so far:"
+          ];
+        } else {
+          intros = [
+            "Here are some ideas:",
+            "I found a few things that caught my eye:",
+            "Check these out:",
+            "Here's what I'm thinking:",
+            "Let me show you a few options:"
+          ];
+        }
 
         reply += intros[Math.floor(Math.random() * intros.length)];
 
@@ -1059,6 +1211,114 @@ async function main() {
         return send(200, { ingested: count });
       }
 
+      if (req.method === "POST" && url.pathname === "/api/track/view") {
+        // Track product view for session-based recommendations
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const bodyText = Buffer.concat(chunks).toString("utf8");
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const productId = body.productId;
+
+        if (!productId) return send(400, { error: "productId required" });
+
+        try {
+          const { getSessionId, trackProductView } = await import('./services/session.js');
+          const sessionId = getSessionId(req);
+          await trackProductView(sessionId, productId, catalog);
+
+          // Also log to events table
+          const { default: pg } = await import("pg");
+          const client = new pg.Client({ connectionString: cfg.postgresUrl! });
+          await client.connect();
+          try {
+            await client.query(`INSERT INTO events(type, payload) VALUES ($1, $2)`, [
+              'product_view',
+              { product_id: productId, session_id: sessionId }
+            ]);
+          } finally { await client.end(); }
+
+          return send(200, { ok: true });
+        } catch (e: any) {
+          console.error("Track view error:", e?.message || e);
+          return send(500, { error: "tracking failed" });
+        }
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/track/click") {
+        // Track product click for session-based recommendations
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const bodyText = Buffer.concat(chunks).toString("utf8");
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const productId = body.productId;
+
+        if (!productId) return send(400, { error: "productId required" });
+
+        try {
+          const { getSessionId, trackProductClick } = await import('./services/session.js');
+          const sessionId = getSessionId(req);
+          await trackProductClick(sessionId, productId, catalog);
+
+          // Also log to events table
+          const { default: pg } = await import("pg");
+          const client = new pg.Client({ connectionString: cfg.postgresUrl! });
+          await client.connect();
+          try {
+            await client.query(`INSERT INTO events(type, payload) VALUES ($1, $2)`, [
+              'product_click',
+              { product_id: productId, session_id: sessionId }
+            ]);
+          } finally { await client.end(); }
+
+          return send(200, { ok: true });
+        } catch (e: any) {
+          console.error("Track click error:", e?.message || e);
+          return send(500, { error: "tracking failed" });
+        }
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/purchases") {
+        // Record a purchase
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const bodyText = Buffer.concat(chunks).toString("utf8");
+        const body = bodyText ? JSON.parse(bodyText) : {};
+
+        const cookies = parseCookies(req);
+        const sid = cookies["sid"];
+        const sess = sid ? sessions.get(sid) : undefined;
+
+        if (!sess) return send(401, { error: "unauthorized" });
+
+        const { productId, amount, recipientKey, occasion } = body;
+
+        if (!productId || !amount) {
+          return send(400, { error: "productId and amount required" });
+        }
+
+        try {
+          const { recordPurchase } = await import('./services/purchase-history.js');
+          const { default: pg } = await import("pg");
+          const pool = new pg.Pool({ connectionString: cfg.postgresUrl! });
+
+          const purchaseId = await recordPurchase(
+            sess.userId,
+            productId,
+            parseFloat(amount),
+            pool,
+            recipientKey,
+            occasion
+          );
+
+          await pool.end();
+
+          return send(200, { ok: true, purchaseId });
+        } catch (e: any) {
+          console.error("POST /api/purchases error:", e?.message || e);
+          return send(500, { error: "purchase recording failed" });
+        }
+      }
+
       if (req.method === "POST" && url.pathname === "/api/feedback") {
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -1089,6 +1349,122 @@ async function main() {
         } catch (e: any) {
           console.error("/api/feedback error:", e?.message || e);
           return send(500, { ok: false, error: e?.message || "feedback failed" });
+        }
+      }
+
+      // A/B Testing Endpoints
+      if (req.method === "POST" && url.pathname === "/api/experiments") {
+        // Create a new experiment
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const bodyText = Buffer.concat(chunks).toString("utf8");
+        const body = bodyText ? JSON.parse(bodyText) : {};
+
+        try {
+          const { default: pg } = await import("pg");
+          const { Pool } = pg;
+          const pool = new Pool({ connectionString: cfg.postgresUrl });
+          const { createExperiment } = await import('./services/ab-testing.js');
+
+          console.log('[AB Testing] Creating experiment:', body.name, 'with variants:', JSON.stringify(body.variants));
+
+          const experiment = await createExperiment(
+            body.name,
+            body.variants,
+            pool,
+            body.endDate ? new Date(body.endDate) : undefined
+          );
+
+          await pool.end();
+          return send(200, experiment);
+        } catch (e: any) {
+          console.error("POST /api/experiments error:", e?.message || e, e?.stack);
+          return send(500, { error: "experiment creation failed", detail: e?.message });
+        }
+      }
+
+      if (req.method === "GET" && url.pathname.startsWith("/api/experiments/")) {
+        // Get experiment results
+        const experimentId = url.pathname.split("/").pop();
+        if (!experimentId) return send(400, { error: "experiment ID required" });
+
+        try {
+          const { default: pg } = await import("pg");
+          const { Pool } = pg;
+          const pool = new Pool({ connectionString: cfg.postgresUrl });
+          const { getExperimentResults } = await import('./services/ab-testing.js');
+
+          const results = await getExperimentResults(experimentId, pool);
+
+          // Convert Map to object for JSON serialization
+          const statsObj: Record<string, any> = {};
+          for (const [key, value] of results.stats.entries()) {
+            statsObj[key] = value;
+          }
+
+          await pool.end();
+          return send(200, { stats: statsObj, winner: results.winner, confidence: results.confidence });
+        } catch (e: any) {
+          console.error("GET /api/experiments/:id error:", e?.message || e);
+          return send(500, { error: "failed to get experiment results" });
+        }
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/ab/impression") {
+        // Record A/B test impression
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const bodyText = Buffer.concat(chunks).toString("utf8");
+        const body = bodyText ? JSON.parse(bodyText) : {};
+
+        try {
+          const { default: pg } = await import("pg");
+          const { Pool } = pg;
+          const pool = new Pool({ connectionString: cfg.postgresUrl });
+          const { recordImpression } = await import('./services/ab-testing.js');
+
+          await recordImpression(
+            body.experimentId,
+            body.variantId,
+            body.userId || 'anonymous',
+            pool,
+            body.metadata
+          );
+
+          await pool.end();
+          return send(200, { ok: true });
+        } catch (e: any) {
+          console.error("POST /api/ab/impression error:", e?.message || e);
+          return send(500, { error: "failed to record impression" });
+        }
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/ab/conversion") {
+        // Record A/B test conversion
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const bodyText = Buffer.concat(chunks).toString("utf8");
+        const body = bodyText ? JSON.parse(bodyText) : {};
+
+        try {
+          const { default: pg } = await import("pg");
+          const { Pool } = pg;
+          const pool = new Pool({ connectionString: cfg.postgresUrl });
+          const { recordConversion } = await import('./services/ab-testing.js');
+
+          await recordConversion(
+            body.experimentId,
+            body.variantId,
+            body.userId || 'anonymous',
+            pool,
+            body.metadata
+          );
+
+          await pool.end();
+          return send(200, { ok: true });
+        } catch (e: any) {
+          console.error("POST /api/ab/conversion error:", e?.message || e);
+          return send(500, { error: "failed to record conversion" });
         }
       }
 

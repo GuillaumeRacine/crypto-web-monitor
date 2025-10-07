@@ -65,8 +65,23 @@ async function upsertPoints(collection, points) {
   }
 }
 
-function productText(p) {
-  const parts = [p.title, p.description || '', p.vendor || '', p.category || '', (p.tags || []).join(' ')];
+function productText(p, facets = []) {
+  const parts = [
+    p.title,
+    p.description || '',
+    p.vendor || '',
+    p.category || '',
+    (p.tags || []).join(' ')
+  ];
+
+  // Add facets for richer semantic context
+  if (facets.length > 0) {
+    const facetText = facets
+      .map(f => `${f.facet_key}: ${f.facet_value}`)
+      .join(', ');
+    parts.push(facetText);
+  }
+
   return parts.filter(Boolean).join(' \n ');
 }
 
@@ -82,7 +97,22 @@ async function run() {
     LEFT JOIN vendors v ON v.id = p.vendor_id
     LEFT JOIN categories c ON c.id = p.category_id
   `);
-  console.log(`Embedding and indexing ${res.rows.length} products to Qdrant...`);
+  console.log(`Fetching facets for enhanced embeddings...`);
+  const facetsRes = await client.query(`
+    SELECT product_id, facet_key, facet_value
+    FROM product_facets
+    WHERE facet_key IN ('recipient', 'occasion', 'interest', 'value', 'theme')
+  `);
+
+  const facetsByProduct = new Map();
+  facetsRes.rows.forEach(row => {
+    if (!facetsByProduct.has(row.product_id)) {
+      facetsByProduct.set(row.product_id, []);
+    }
+    facetsByProduct.get(row.product_id).push(row);
+  });
+
+  console.log(`Embedding and indexing ${res.rows.length} products to Qdrant with multi-modal context...`);
   const batchSize = 64;
   for (let i = 0; i < res.rows.length; i += batchSize) {
     const batch = res.rows.slice(i, i + batchSize);
@@ -100,7 +130,11 @@ async function run() {
         productUrl: row.product_url,
         tags: row.tags || [],
       };
-      const vec = await embed(productText(p));
+
+      // Get facets for this product
+      const facets = facetsByProduct.get(row.id) || [];
+
+      const vec = await embed(productText(p, facets));
       points.push({
         id: p.id,
         vector: vec,

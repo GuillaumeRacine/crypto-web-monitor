@@ -21,7 +21,9 @@
     "dev:five": "MODE=five-db node scripts/dev_all.mjs",
     "web:dev": "next dev src/web -p 3000",
     "web:build": "next build src/web",
-    "web:start": "next start src/web -p 3000"
+    "web:start": "next start src/web -p 3000",
+    "test:conversations": "npx tsx scripts/run-conversation-tests.ts",
+    "analyze:ux": "npx tsx scripts/analyze-conversations.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",

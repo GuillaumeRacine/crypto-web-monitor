@@ -94,6 +94,11 @@ export interface RecommendedItem {
 export interface RecommendationResult {
   items: RecommendedItem[];
   tookMs?: number;
+  performanceMetrics?: {
+    contextLoadMs: number;
+    recommendationMs: number;
+    totalMs: number;
+  };
 }
 
 // Adapter interfaces

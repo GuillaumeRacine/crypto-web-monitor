@@ -4,18 +4,26 @@ AI gift recommendation assistant prototype. This repo ingests merchant product c
 
 ## Documentation
 
-- **Product Vision**: `product_vision.md` - Background, goals, and hypothesis
-- **Agent Guidelines**: `AGENTS.md` - Development conventions, architecture, recommendation vision
-- **Personalization Roadmap**: `PERSONALIZATION_RECOMMENDATIONS.md` - Advanced personalization techniques
+### 📘 Start Here (Required Reading)
+
+- **`RECOMMENDATION_SYSTEM_GUIDE.md`** ⭐ - **COMPLETE GUIDE** for developers and LLMs. Everything you need to understand how the recommendation system works, from product vision to code architecture.
+
+### 📚 Additional Documentation
+
+- **Product Vision**: `product_vision.md` - Market problem, hypothesis, business model
+- **Agent Guidelines**: `AGENTS.md` - Development conventions and coding standards
+- **Context Strategy**: `CONTEXT_IMPROVEMENTS.md` - How we gather sufficient context before recommending
+- **UX Improvements**: `ALL_UX_FIXES_COMPLETE.md` - Recent UX enhancements (budget badges, urgency detection, etc.)
 - **Facet System**: `FACETS.md` - Gift-relevant attribute extraction
 
-### For LLM Agents
+### 🤖 For LLM Agents
 
-Comprehensive guides for AI assistants working on the recommendation system:
-
-- **`docs/LLM_RECOMMENDATION_GUIDE.md`** - Complete recommendation pipeline, semantic search, scoring, and reranking
-- **`docs/LLM_FACET_EXTRACTION_GUIDE.md`** - Automated facet extraction from product data
-- **`docs/LLM_RATIONALE_GUIDE.md`** - Generating compelling, personalized gift explanations
+If you're an AI assistant working on this codebase:
+1. Read `RECOMMENDATION_SYSTEM_GUIDE.md` first (comprehensive guide)
+2. Refer to specific guides as needed:
+   - `docs/LLM_RECOMMENDATION_GUIDE.md` - Recommendation pipeline details
+   - `docs/LLM_FACET_EXTRACTION_GUIDE.md` - Facet extraction
+   - `docs/LLM_RATIONALE_GUIDE.md` - Rationale generation
 
 Note: This project runs exclusively in Five‑DB mode (Postgres, Neo4j, Vector DB, Redis, Event Store). Simple mode has been removed.
 
