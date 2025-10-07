@@ -1,11 +1,11 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:3001";
 
-export default function FacetedProductsPage() {
+function FacetedProductsContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -238,5 +238,13 @@ export default function FacetedProductsPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function FacetedProductsPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-gray-50 p-4 flex items-center justify-center">Loading...</div>}>
+      <FacetedProductsContent />
+    </Suspense>
   );
 }
