@@ -238,12 +238,12 @@ export default function HomePage() {
                       </div>
 
                       {/* Quick Filters */}
-                      {m.recs.length > 3 && (
+                      {m.recs && m.recs.length > 3 && (
                         <div className="mt-4 flex flex-wrap gap-2">
                           <span className="text-sm text-gray-600">Quick filters:</span>
                           <button
                             onClick={() => {
-                              const cheaper = m.recs.filter((r: any) => r.product.price < (ctx.budgetMax || 100)).slice(0, 3);
+                              const cheaper = (m.recs || []).filter((r: any) => r.product.price < (ctx.budgetMax || 100)).slice(0, 3);
                               setMessages((msgs) => [...msgs, { role: "assistant", content: "Here are more affordable options:", recs: cheaper }]);
                             }}
                             className="text-xs px-3 py-1 rounded-full border border-gray-300 hover:bg-gray-50"
@@ -252,7 +252,7 @@ export default function HomePage() {
                           </button>
                           <button
                             onClick={() => {
-                              const sorted = [...m.recs].sort((a: any, b: any) => (b.score || 0) - (a.score || 0)).slice(0, 3);
+                              const sorted = [...(m.recs || [])].sort((a: any, b: any) => (b.score || 0) - (a.score || 0)).slice(0, 3);
                               setMessages((msgs) => [...msgs, { role: "assistant", content: "Top matches by score:", recs: sorted }]);
                             }}
                             className="text-xs px-3 py-1 rounded-full border border-gray-300 hover:bg-gray-50"
